@@ -1,0 +1,602 @@
+/*
+ * ESP32-WROVER Fatigue Detection System
+ * Motion-Based Driver Monitoring
+ * Optimized for smooth streaming
+ */
+
+#include "esp_camera.h"
+#include "esp_timer.h"
+#include "esp_http_server.h"
+#include <WiFi.h>
+
+// ============================================
+// PIN DEFINITIONS FOR ESP32-WROVER-MODULE
+// ============================================
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// LED pin (built-in flash LED)
+#define LED_PIN 4
+
+// ============================================
+// WIFI CREDENTIALS
+// ============================================
+const char* ssid = "Galaxy S24";
+const char* password = "OCNETVENUMA";
+
+// ============================================
+// FATIGUE DETECTION PARAMETERS
+// ============================================
+#define MOTION_THRESHOLD 100       // Minimum motion to consider driver active
+#define NO_MOTION_FRAMES 60        // Frames with no motion = fatigue
+#define LOW_MOTION_FRAMES 100      // Frames with low motion = drowsiness
+#define FATIGUE_THRESHOLD 2        // Number of fatigue events to trigger alarm
+
+// ============================================
+// GLOBAL VARIABLES
+// ============================================
+int noMotionCounter = 0;
+int lowMotionCounter = 0;
+int fatigueScore = 0;
+bool alarmActive = false;
+unsigned long lastDetectionTime = 0;
+uint32_t lastFrameChecksum = 0;
+int frameCount = 0;
+
+httpd_handle_t camera_httpd = NULL;
+
+// ============================================
+// FUNCTION DECLARATIONS
+// ============================================
+void setupCamera();
+void setupLED();
+void detectFatigue(camera_fb_t *fb);
+void triggerAlarm();
+void resetAlarm();
+esp_err_t stream_handler(httpd_req_t *req);
+esp_err_t capture_handler(httpd_req_t *req);
+esp_err_t index_handler(httpd_req_t *req);
+esp_err_t status_handler(httpd_req_t *req);
+
+// ============================================
+// SETUP FUNCTION
+// ============================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("\n\n==========================================");
+  Serial.println("ESP32-WROVER Fatigue Detection System");
+  Serial.println("==========================================\n");
+  
+  // Initialize LED
+  setupLED();
+  
+  // Connect to WiFi
+  Serial.println("Connecting to WiFi...");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  WiFi.setSleep(false);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  Serial.println();
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi Connected!");
+    Serial.print("IP Address: http://");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("WiFi Failed! Check credentials.");
+    return;
+  }
+  
+  // Initialize Camera
+  Serial.println("Initializing camera...");
+  setupCamera();
+  
+  // Start Web Server
+  Serial.println("Starting web server...");
+  
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 80;
+  config.ctrl_port = 32768;
+  config.max_uri_handlers = 12;
+  config.stack_size = 4096;
+  config.task_priority = 5;
+  
+  httpd_uri_t index_uri = {
+    .uri = "/",
+    .method = HTTP_GET,
+    .handler = index_handler,
+    .user_ctx = NULL
+  };
+  
+  httpd_uri_t stream_uri = {
+    .uri = "/stream",
+    .method = HTTP_GET,
+    .handler = stream_handler,
+    .user_ctx = NULL
+  };
+  
+  httpd_uri_t status_uri = {
+    .uri = "/status",
+    .method = HTTP_GET,
+    .handler = status_handler,
+    .user_ctx = NULL
+  };
+  
+  httpd_uri_t capture_uri = {
+    .uri = "/capture",
+    .method = HTTP_GET,
+    .handler = capture_handler,
+    .user_ctx = NULL
+  };
+  
+  if (httpd_start(&camera_httpd, &config) == ESP_OK) {
+    httpd_register_uri_handler(camera_httpd, &index_uri);
+    httpd_register_uri_handler(camera_httpd, &stream_uri);
+    httpd_register_uri_handler(camera_httpd, &status_uri);
+    httpd_register_uri_handler(camera_httpd, &capture_uri);
+    Serial.println("Web server started!");
+  } else {
+    Serial.println("Failed to start web server");
+  }
+  
+  Serial.println("\n==========================================");
+  Serial.println("SYSTEM READY!");
+  Serial.println("==========================================");
+  Serial.print("Open: http://");
+  Serial.println(WiFi.localIP());
+  Serial.println("==========================================\n");
+}
+
+// ============================================
+// MAIN LOOP
+// ============================================
+void loop() {
+  // Auto-reset alarm after 10 seconds
+  if (alarmActive && (millis() - lastDetectionTime > 10000)) {
+    resetAlarm();
+  }
+  delay(100);
+}
+
+// ============================================
+// CAMERA SETUP
+// ============================================
+void setupCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size = FRAMESIZE_QVGA; // 320x240
+  config.jpeg_quality = 12;
+  config.fb_count = 2;
+  config.grab_mode = CAMERA_GRAB_LATEST;
+  
+  // Camera init
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed: 0x%x\n", err);
+    return;
+  }
+  
+  sensor_t * s = esp_camera_sensor_get();
+  if (s != NULL) {
+    s->set_framesize(s, FRAMESIZE_QVGA);
+    s->set_quality(s, 12);
+    s->set_brightness(s, 0);
+    s->set_contrast(s, 0);
+    s->set_saturation(s, 0);
+    Serial.println("Camera ready!");
+  }
+}
+
+// ============================================
+// LED SETUP
+// ============================================
+void setupLED() {
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  
+  // Startup blink
+  digitalWrite(LED_PIN, HIGH);
+  delay(200);
+  digitalWrite(LED_PIN, LOW);
+}
+
+// ============================================
+// FATIGUE DETECTION
+// ============================================
+void detectFatigue(camera_fb_t *fb) {
+  if (!fb || !fb->buf) return;
+  
+  frameCount++;
+  
+  // Only process every 3rd frame for performance
+  if (frameCount % 3 != 0) return;
+  
+  // Calculate simple checksum for motion detection
+  uint32_t checksum = 0;
+  for (size_t i = 0; i < fb->len; i += 200) {
+    checksum += fb->buf[i];
+  }
+  
+  int motion = abs((int)(checksum - lastFrameChecksum));
+  lastFrameChecksum = checksum;
+  
+  // Skip first frame
+  if (frameCount < 5) return;
+  
+  // Motion detection
+  if (motion < MOTION_THRESHOLD) {
+    noMotionCounter++;
+    lowMotionCounter++;
+  } else {
+    if (noMotionCounter > 0) noMotionCounter--;
+    if (lowMotionCounter > 0) lowMotionCounter--;
+  }
+  
+  // Fatigue detection
+  if (noMotionCounter > NO_MOTION_FRAMES) {
+    fatigueScore++;
+    noMotionCounter = 0;
+    Serial.println("FATIGUE: No movement detected!");
+  }
+  
+  if (lowMotionCounter > LOW_MOTION_FRAMES) {
+    fatigueScore++;
+    lowMotionCounter = 0;
+    Serial.println("FATIGUE: Low activity detected!");
+  }
+  
+  // Trigger alarm
+  if (fatigueScore >= FATIGUE_THRESHOLD) {
+    triggerAlarm();
+    fatigueScore = 0;
+  }
+}
+
+// ============================================
+// ALARM TRIGGER
+// ============================================
+void triggerAlarm() {
+  if (!alarmActive) {
+    Serial.println("\n*** FATIGUE ALARM TRIGGERED ***\n");
+    alarmActive = true;
+    lastDetectionTime = millis();
+    
+    // Flash LED
+    for (int i = 0; i < 5; i++) {
+      digitalWrite(LED_PIN, HIGH);
+      delay(150);
+      digitalWrite(LED_PIN, LOW);
+      delay(150);
+    }
+  }
+}
+
+// ============================================
+// ALARM RESET
+// ============================================
+void resetAlarm() {
+  Serial.println("Alarm reset");
+  alarmActive = false;
+  fatigueScore = 0;
+  noMotionCounter = 0;
+  lowMotionCounter = 0;
+  digitalWrite(LED_PIN, LOW);
+}
+
+// ============================================
+// VIDEO STREAM HANDLER
+// ============================================
+esp_err_t stream_handler(httpd_req_t *req) {
+  camera_fb_t *fb = NULL;
+  esp_err_t res = ESP_OK;
+  size_t _jpg_buf_len = 0;
+  uint8_t *_jpg_buf = NULL;
+  char part_buf[128];
+  
+  Serial.println("Stream started");
+  
+  res = httpd_resp_set_type(req, "multipart/x-mixed-replace; boundary=frame");
+  if (res != ESP_OK) {
+    Serial.println("Failed to set response type");
+    return res;
+  }
+  
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  httpd_resp_set_hdr(req, "X-Framerate", "60");
+  
+  while (true) {
+    fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("Camera capture failed");
+      res = ESP_FAIL;
+      break;
+    }
+    
+    // Run fatigue detection
+    detectFatigue(fb);
+    
+    if (fb->format != PIXFORMAT_JPEG) {
+      bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
+      esp_camera_fb_return(fb);
+      fb = NULL;
+      if (!jpeg_converted) {
+        Serial.println("JPEG conversion failed");
+        res = ESP_FAIL;
+        break;
+      }
+    } else {
+      _jpg_buf_len = fb->len;
+      _jpg_buf = fb->buf;
+    }
+    
+    if (res == ESP_OK) {
+      res = httpd_resp_send_chunk(req, "\r\n--frame\r\n", 11);
+    }
+    if (res == ESP_OK) {
+      size_t hlen = snprintf((char *)part_buf, 128, "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", _jpg_buf_len);
+      res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
+    }
+    if (res == ESP_OK) {
+      res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
+    }
+    
+    if (fb) {
+      esp_camera_fb_return(fb);
+      fb = NULL;
+      _jpg_buf = NULL;
+    } else if (_jpg_buf) {
+      free(_jpg_buf);
+      _jpg_buf = NULL;
+    }
+    
+    if (res != ESP_OK) {
+      Serial.println("Stream error, client disconnected");
+      break;
+    }
+  }
+  
+  Serial.println("Stream ended");
+  return res;
+}
+
+// ============================================
+// SINGLE CAPTURE HANDLER (For Testing)
+// ============================================
+esp_err_t capture_handler(httpd_req_t *req) {
+  camera_fb_t *fb = NULL;
+  esp_err_t res = ESP_OK;
+  
+  Serial.println("Capture request received");
+  
+  fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+  
+  Serial.printf("Captured image: %dx%d, size: %u bytes\n", fb->width, fb->height, fb->len);
+  
+  httpd_resp_set_type(req, "image/jpeg");
+  httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  
+  res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
+  
+  esp_camera_fb_return(fb);
+  
+  Serial.println("Capture sent");
+  return res;
+}
+
+// ============================================
+// WEB INTERFACE HANDLER
+// ============================================
+esp_err_t index_handler(httpd_req_t *req) {
+  const char* html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Fatigue Detection</title>
+  <meta name='viewport' content='width=device-width, initial-scale=1'>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { 
+      font-family: Arial, sans-serif; 
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      padding: 15px;
+    }
+    .container {
+      max-width: 900px;
+      margin: 0 auto;
+      background: white;
+      border-radius: 15px;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+      overflow: hidden;
+    }
+    .header {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      padding: 20px;
+      text-align: center;
+    }
+    h1 { font-size: 1.8em; margin-bottom: 5px; }
+    .subtitle { opacity: 0.9; }
+    .video-container {
+      position: relative;
+      width: 100%;
+      background: #000;
+    }
+    #stream { 
+      width: 100%; 
+      height: auto;
+      display: block;
+    }
+    .status-panel { padding: 20px; }
+    .status { 
+      padding: 15px; 
+      margin: 10px 0; 
+      border-radius: 8px;
+      text-align: center;
+      font-size: 1.1em;
+      font-weight: bold;
+    }
+    .alert { 
+      background: #ff4444;
+      color: white; 
+      animation: pulse 1s infinite;
+    }
+    .normal { 
+      background: #44ff44;
+      color: #004400;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.8; }
+    }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+      margin-top: 15px;
+    }
+    .stat-card {
+      background: #f5f5f5;
+      padding: 15px;
+      border-radius: 8px;
+      text-align: center;
+    }
+    .stat-value {
+      font-size: 1.8em;
+      font-weight: bold;
+      color: #667eea;
+    }
+    .stat-label {
+      margin-top: 5px;
+      color: #666;
+      font-size: 0.85em;
+    }
+  </style>
+</head>
+<body>
+  <div class='container'>
+    <div class='header'>
+      <h1>🚗 Driver Fatigue Detection</h1>
+      <p class='subtitle'>Real-time Monitoring Active</p>
+    </div>
+    
+    <div class='video-container'>
+      <img id='stream' src='/stream' onerror="console.log('Stream error'); setTimeout(() => this.src='/stream?t='+Date.now(), 2000);" onload="console.log('Stream loaded');" />
+    </div>
+    
+    <div class='status-panel'>
+      <div id='status' class='status normal'>System Active</div>
+      
+      <div class='stats'>
+        <div class='stat-card'>
+          <div class='stat-value' id='score'>0</div>
+          <div class='stat-label'>Fatigue Score</div>
+        </div>
+        <div class='stat-card'>
+          <div class='stat-value' id='noMotion'>0</div>
+          <div class='stat-label'>No Motion</div>
+        </div>
+        <div class='stat-card'>
+          <div class='stat-value' id='lowMotion'>0</div>
+          <div class='stat-label'>Low Activity</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  
+  <script>
+    function updateStatus() {
+      fetch('/status')
+        .then(r => r.json())
+        .then(data => {
+          document.getElementById('score').textContent = data.score;
+          document.getElementById('noMotion').textContent = data.noMotion;
+          document.getElementById('lowMotion').textContent = data.lowMotion;
+          
+          const status = document.getElementById('status');
+          if(data.alarm) {
+            status.className = 'status alert';
+            status.textContent = '🚨 FATIGUE ALERT - TAKE A BREAK! 🚨';
+          } else {
+            status.className = 'status normal';
+            status.textContent = '✓ Monitoring Active';
+          }
+        })
+        .catch(() => {});
+    }
+    
+    setInterval(updateStatus, 1000);
+    updateStatus();
+  </script>
+</body>
+</html>
+  )rawliteral";
+  
+  httpd_resp_set_type(req, "text/html");
+  return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+}
+
+// ============================================
+// STATUS API HANDLER
+// ============================================
+esp_err_t status_handler(httpd_req_t *req) {
+  char json[150];
+  snprintf(json, sizeof(json), 
+    "{\"alarm\":%s,\"score\":%d,\"noMotion\":%d,\"lowMotion\":%d}",
+    alarmActive ? "true" : "false",
+    fatigueScore,
+    noMotionCounter,
+    lowMotionCounter
+  );
+  
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+}
