@@ -1,0 +1,703 @@
+/*
+ * ═══════════════════════════════════════════════════════════════
+ * SMART HELMET - MAIN HUB MODULE (ESP32-S)
+ * Guardian System: Complete Safety Monitoring System
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * VERSION 2.20 (Environmental Re-Arming Fix)
+ * ✅ FIX: Removed 'environmental_alert_latch' completely.
+ * ✅ Environmental alerts now use the 10-second cooldown timer
+ * (same as crash detection), allowing them to re-trigger.
+ * ✅ This fixes the "one detection" restriction.
+ * ✅ All other working code (SMS, MPU band-aid, Thresholds) is untouched.
+ *
+ * !! MPU HARDWARE FIX IS STILL REQUIRED !!
+ * The MPU will NOT work reliably until you move its VCC to 3.3V and
+ * add 4.7kΩ pull-up resistors to 3.3V on SDA/SCL.
+ *
+ * ═══════════════════════════════════════════════════════════════
+ */
+
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <DHT.h>
+
+// ═══════════════════ PIN DEFINITIONS ═══════════════════
+#define MPU_SDA_PIN 21
+#define MPU_SCL_PIN 22
+#define GSM_RX_PIN 27
+#define GSM_TX_PIN 26
+#define DHT_PIN 4
+#define MQ135_PIN 34      // Air quality (ADC1_CH6)
+#define MQ3_PIN 35        // Alcohol (ADC1_CH7)
+#define PANIC_BTN_PIN 15  // With internal pull-up
+#define MAIN_BUZZER_PIN 5
+
+// ═══════════════════ SENSOR OBJECTS ═══════════════════
+Adafruit_MPU6050 mpu;
+DHT dht(DHT_PIN, DHT11);
+
+// Serial connections
+HardwareSerial gsmSerial(1);  // GSM on Serial1
+
+// ═══════════════════ THRESHOLDS & CONFIG ═══════════════════
+// ** MODIFIED v2.14 ** - Increased for "major impact"
+#define CRASH_THRESHOLD 30.0        // m/s² (approx 3G)
+
+// ** MODIFIED v2.17 ** - Lowered for easier testing
+#define TEMP_THRESHOLD 29.0         // Celsius (77°F)
+
+#define ALERT_COOLDOWN_MS 10000     // 10 seconds cooldown
+#define SHORT_BUZZ_DURATION 200     // milliseconds
+#define BUTTON_DEBOUNCE_MS 50       // Debounce delay
+#define BUTTON_LONG_PRESS_MS 1000   // 1 second hold
+
+// MQ Sensor Calibration Settings
+#define MQ_WARMUP_TIME 60000        // 60 seconds (reduce to 10000 for testing)
+#define MQ_SAMPLE_INTERVAL 500      // Sample every 500ms
+#define MQ_SAMPLES_FOR_BASELINE 20  // 20 samples for baseline
+
+// ** MODIFIED v2.11 **
+#define MQ135_THRESHOLD_MULTIPLIER 0.6 // Air Quality (20% above baseline) - VERY SENSITIVE
+
+// ** MODIFIED v2.16 ** - Made alcohol sensor sensitive again (was 1.8)
+#define MQ3_THRESHOLD_MULTIPLIER 1.35   // Alcohol (30% above baseline) - SENSITIVE
+
+// ═══════════════════ EMERGENCY CONTACTS ═══════════════════
+const char* EMERGENCY_CONTACTS[] = {
+  "+916382857688",  // Contact 1 - Replace with real number
+  "+918825839476",  // Contact 2 - Replace with real number
+  "+918281428018"   // Contact 3 - Replace with real number
+};
+const int NUM_CONTACTS = 3;
+
+// ═══════════════════ STATE VARIABLES ═══════════════════
+// Critical alert latches (never reset)
+// bool accident_detected_latch = false; // <-- **REMOVED v2.15**
+bool panic_button_pressed_latch = false;
+// bool environmental_alert_latch = false; // ** REMOVED v2.20 **
+
+// Environmental and Crash alert timing
+unsigned long last_env_alert_time = 0;
+unsigned long last_crash_alert_time = 0; // ** NEW v2.15 **
+
+// Button state tracking
+bool button_was_pressed = false;
+unsigned long button_press_start = 0;
+bool long_press_triggered = false;
+
+// MQ sensor calibration state
+bool mq_sensors_ready = false;
+int mq135_baseline = 0;
+int mq3_baseline = 0;
+int mq135_threshold = 0;
+int mq3_threshold = 0;
+unsigned long mq_warmup_start = 0;
+
+// Safety flag for MPU6050
+bool mpu_is_ready = false;
+
+// ** NEW v2.9 ** Buzzer timer state
+unsigned long buzzer_on_time = 0;
+unsigned long buzzer_duration = 5000; // 5 seconds
+
+// ═══════════════════ SMS STATE MACHINE (NON-BLOCKING) ═══════════════════
+enum SmsState { SMS_IDLE, SMS_SEND_CMD, SMS_SEND_BODY, SMS_WAIT_RESPONSE };
+SmsState sms_state = SMS_IDLE;
+unsigned long sms_timer = 0;
+bool alert_pending = false;
+String alert_message_to_send = "";
+int contact_index_to_send = 0;
+
+// ═══════════════════════════════════════════════════════════════
+//                           SETUP (Re-ordered for power stability)
+// ═══════════════════════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+
+  printHeader();
+
+  // Configure non-sensor GPIO pins first
+  pinMode(PANIC_BTN_PIN, INPUT_PULLUP);  // Internal pull-up resistor
+  pinMode(MAIN_BUZZER_PIN, OUTPUT);
+  digitalWrite(MAIN_BUZZER_PIN, LOW); // Buzzer starts OFF
+
+  // Test buzzer functionality
+  Serial.println("🔊 Testing buzzer...");
+  testBuzzer();
+
+  // -----------------------------------------------------------------
+  // Initialize the high-power devices (GSM) FIRST.
+  // -----------------------------------------------------------------
+  
+  Serial.println("\nInitializing high-power modules...");
+  initGSM(); // This function now checks for network
+  initDHT();
+  Serial.println("✓ High-power modules initialized. Waiting for stability...");
+  
+  delay(2000); 
+
+  // -----------------------------------------------------------------
+  // Now initialize the sensitive MPU6050.
+  // -----------------------------------------------------------------
+  
+  Serial.println("\nInitializing I2C bus and MPU6050...");
+  Wire.begin(MPU_SDA_PIN, MPU_SCL_PIN);
+  delay(100); // Give I2C bus time to settle
+  
+  // Initialize MPU6050 (This function is non-halting)
+  initMPU6050(); 
+
+  // Continue no matter what
+  Serial.println("\n✓ System setup complete. Continuing to main loop...");
+  Serial.println("📌 Panic Button: Press and hold for 1 second");
+  Serial.println("⚡ Main Hub ready - Starting MQ sensor calibration...\n");
+
+  // Begin MQ sensor warm-up process
+  startMQCalibration();
+
+  // Startup confirmation (2 beeps)
+  shortBuzz();
+  delay(200);
+  shortBuzz();
+}
+
+// ═══════════════════════════════════════════════════════════════
+//                         MAIN LOOP
+// ═══════════════════════════════════════════════════════════════
+void loop() {
+  // Monitor panic button with debounce logic
+  checkPanicButton();
+
+  // Handle MQ sensor calibration if not complete
+  if (!mq_sensors_ready) {
+    handleMQCalibration();
+  }
+
+  // Monitor for crash/accident (only if MPU is ready)
+  checkAccident();
+
+  // Check environmental sensors (after calibration, with cooldown)
+  // ** MODIFIED v2.20 ** - Removed environmental_alert_latch
+  if (mq_sensors_ready && (millis() - last_env_alert_time > ALERT_COOLDOWN_MS)) {
+    checkEnvironmentalAlerts();
+  }
+
+  // Handle the 5-second buzzer timer
+  handleBuzzer();
+  
+  // Handle non-blocking SMS sending
+  handleSmsSending();
+
+  delay(100);  // 10Hz update rate
+}
+
+// ═══════════════════════════════════════════════════════════════
+//                 INITIALIZATION FUNCTIONS
+// ═══════════════════════════════════════════════════════════════
+
+void printHeader() {
+  Serial.println("\n╔════════════════════════════════════════╗");
+  Serial.println("║   SMART HELMET - MAIN HUB v2.20        ║");
+  Serial.println("║   (Environmental Re-Arm Fix)           ║");
+  Serial.println("╚════════════════════════════════════════╝\n");
+}
+
+void testBuzzer() {
+  Serial.println("    Testing 3-beep pattern...");
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(MAIN_BUZZER_PIN, HIGH);
+    Serial.printf("    Beep %d - ON\n", i+1);
+    delay(150);
+    digitalWrite(MAIN_BUZZER_PIN, LOW);
+    Serial.println("          OFF");
+    delay(150);
+  }
+  Serial.println("✓ Buzzer test complete\n");
+}
+
+// 
+// This function will no longer halt the code.
+//
+void initMPU6050() {
+  Serial.print("Initializing MPU6050... ");
+
+  if (!mpu.begin(0x68, &Wire)) {  // Try default I2C address
+    Serial.println("❌ FAILED");
+    Serial.println("⚠️  MPU6050 NOT FOUND! Accident detection will be DISABLED.");
+    Serial.println("    - This is a HARDWARE problem. Check 3.3V power & pull-ups.");
+    mpu_is_ready = false; // Set flag to false
+  } else {
+    // Configure MPU6050 settings
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    Serial.println("✓ OK");
+    mpu_is_ready = true; // Set flag to true
+  }
+}
+
+// 
+// This function now checks for network registration
+//
+void initGSM() {
+  Serial.print("Initializing SIM800L GSM... ");
+  gsmSerial.begin(9600, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN);
+  delay(3000);  // Wait for GSM module boot
+
+  // Send AT command test
+  Serial.println("\nSending AT command...");
+  gsmSerial.println("AT");
+  delay(1000);
+
+  if (gsmSerial.available()) {
+    String response = gsmSerial.readString();
+    if (response.indexOf("OK") >= 0) {
+      Serial.println("✓ Module responded OK");
+    } else {
+      Serial.println("⚠️  Module responded but not OK");
+    }
+  } else {
+    Serial.println("⚠️  No response! Check power/wiring.");
+  }
+
+  // Configure SMS text mode
+  Serial.println("Setting SMS mode (AT+CMGF=1)...");
+  gsmSerial.println("AT+CMGF=1");
+  delay(1000);
+  clearGSMBuffer();
+
+  // Check network registration
+  Serial.println("Checking network registration (AT+CREG?)...");
+  unsigned long start_time = millis();
+  bool registered = false;
+  while (millis() - start_time < 30000) { // Wait up to 30s
+    gsmSerial.println("AT+CREG?");
+    delay(1000);
+    if (gsmSerial.available()) {
+      String response = gsmSerial.readString();
+      // Check for "+CREG: 0,1" (Registered, home) or "+CREG: 0,5" (Registered, roaming)
+      if (response.indexOf("+CREG: 0,1") >= 0 || response.indexOf("+CREG: 0,5") >= 0) {
+        Serial.println("✓ Network registered!");
+        registered = true;
+        break;
+      } else {
+        Serial.println("    ...not registered, trying again...");
+      }
+    }
+    delay(2000);
+  }
+  if (!registered) {
+    Serial.println("❌ FAILED to register on network. SMS will likely fail.");
+  }
+  clearGSMBuffer();
+}
+
+void initDHT() {
+  Serial.print("Initializing DHT11... ");
+  dht.begin();
+  // Add a quick check to see if DHT is found
+  float temp = dht.readTemperature();
+  if (isnan(temp)) {
+    Serial.println("❌ FAILED! Check wiring to GPIO 4.");
+  } else {
+    Serial.println("✓ OK");
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//                 MQ SENSOR CALIBRATION
+// ═══════════════════════════════════════════════════════════════
+
+void startMQCalibration() {
+  mq_warmup_start = millis();
+  Serial.println("🔥 MQ Sensor Calibration Started");
+  Serial.println("───────────────────────────────────────");
+  Serial.println("    Phase 1: Warm-up (heating elements)");
+  Serial.printf("    Duration: %d seconds\n", MQ_WARMUP_TIME / 1000);
+  Serial.println("    MQ-135 (Air Quality) | MQ-3 (Alcohol)");
+  Serial.println("    Please wait...\n");
+}
+
+// 
+// ** MODIFIED v2.10 ** - Now uses separate multipliers
+//
+void handleMQCalibration() {
+  unsigned long elapsed = millis() - mq_warmup_start;
+
+  // Phase 1: Warm-up period
+  if (elapsed < MQ_WARMUP_TIME) {
+    // Progress update every 10 seconds
+    static unsigned long last_update = 0;
+    if (millis() - last_update > 10000) {
+      last_update = millis();
+      int seconds_left = (MQ_WARMUP_TIME - elapsed) / 1000;
+      Serial.printf("⏳ Warm-up: %d seconds remaining...\n", seconds_left);
+    }
+    return;
+  }
+
+  // Phase 2: Baseline sampling
+  Serial.println("\n✓ Warm-up complete!");
+  Serial.println("───────────────────────────────────────");
+  Serial.println("    Phase 2: Baseline Calibration");
+  Serial.println("    ⚠️  Ensure sensors are in CLEAN AIR");
+  Serial.println("    (No smoke, alcohol, or strong odors)\n");
+
+  long mq135_sum = 0;
+  long mq3_sum = 0;
+
+  // Take multiple samples for accurate baseline
+  for (int i = 0; i < MQ_SAMPLES_FOR_BASELINE; i++) {
+    int mq135_reading = analogRead(MQ135_PIN);
+    int mq3_reading = analogRead(MQ3_PIN);
+
+    mq135_sum += mq135_reading;
+    mq3_sum += mq3_reading;
+
+    Serial.printf("    Sample %2d/%d: MQ-135=%4d | MQ-3=%4d\n", 
+                  i+1, MQ_SAMPLES_FOR_BASELINE, mq135_reading, mq3_reading);
+
+    delay(MQ_SAMPLE_INTERVAL);
+  }
+
+  // Calculate baseline (average of clean air)
+  mq135_baseline = mq135_sum / MQ_SAMPLES_FOR_BASELINE;
+  mq3_baseline = mq3_sum / MQ_SAMPLES_FOR_BASELINE;
+
+  // ** MODIFIED v2.10 ** - Set dynamic thresholds using separate multipliers
+  mq135_threshold = mq135_baseline * MQ135_THRESHOLD_MULTIPLIER;
+  mq3_threshold = mq3_baseline * MQ3_THRESHOLD_MULTIPLIER;
+
+  // Display results
+  Serial.println("\n╔════════════════════════════════════════╗");
+  Serial.println("║   CALIBRATION COMPLETE ✓               ║");
+  Serial.println("╚════════════════════════════════════════╝");
+  Serial.printf("📊 MQ-135 (Air): Baseline=%d | Threshold=%d (at %.2fx)\n", 
+                mq135_baseline, mq135_threshold, MQ135_THRESHOLD_MULTIPLIER);
+  Serial.printf("📊 MQ-3 (Alcohol): Baseline=%d | Threshold=%d (at %.2fx)\n", 
+                mq3_baseline, mq3_threshold, MQ3_THRESHOLD_MULTIPLIER);
+  Serial.println("───────────────────────────────────────");
+  Serial.println("✓ Sensors ready for monitoring\n");
+
+  mq_sensors_ready = true;
+
+  // Success confirmation (2 beeps)
+  shortBuzz();
+  delay(150);
+  shortBuzz();
+}
+
+// ═══════════════════════════════════════════════════════════════
+//                 MONITORING FUNCTIONS
+// ═══════════════════════════════════════════════════════════════
+
+void checkPanicButton() {
+  int button_state = digitalRead(PANIC_BTN_PIN);
+  bool button_is_pressed = (button_state == LOW);  // LOW = pressed (pull-up)
+
+  // Debug: Show state changes
+  static int last_state = HIGH;
+  if (button_state != last_state) {
+    Serial.printf("🔘 Button: %s\n", button_is_pressed ? "PRESSED ▼" : "RELEASED ▲");
+    last_state = button_state;
+  }
+
+  // Button just pressed
+  if (button_is_pressed && !button_was_pressed) {
+    delay(BUTTON_DEBOUNCE_MS);  // Debounce
+    
+    if (digitalRead(PANIC_BTN_PIN) == LOW) {  // Verify still pressed
+      button_was_pressed = true;
+      button_press_start = millis();
+      long_press_triggered = false;
+      
+      Serial.println("    Hold for 1 second to activate panic...");
+      
+      // Confirmation beep
+      digitalWrite(MAIN_BUZZER_PIN, HIGH);
+      delay(100);
+      digitalWrite(MAIN_BUZZER_PIN, LOW);
+    }
+  }
+
+  // Button being held
+  if (button_is_pressed && button_was_pressed && !long_press_triggered) {
+    unsigned long hold_time = millis() - button_press_start;
+    
+    if (hold_time >= BUTTON_LONG_PRESS_MS) {
+      long_press_triggered = true;
+      panic_button_pressed_latch = true;
+      
+      Serial.println("\n╔════════════════════════════════════════╗");
+      Serial.println("║   🚨 PANIC ACTIVATED!                  ║");
+      Serial.println("║   Emergency Alert Triggered            ║");
+      Serial.println("╚════════════════════════════════════════╝\n");
+      
+      sendSmsAlert("🚨 PANIC BUTTON! Rider needs immediate help!");
+      triggerBuzzer(5000); // Trigger buzzer for 5 seconds
+    }
+  }
+
+  // Button released
+  if (!button_is_pressed && button_was_pressed) {
+    if (!long_press_triggered) {
+      Serial.println("    Released early - No panic sent\n");
+    }
+    button_was_pressed = false;
+  }
+}
+
+// 
+// ** MODIFIED v2.15 ** - Replaced latch with a cooldown timer
+//
+void checkAccident() {
+  // If the MPU is not ready, skip this function entirely.
+  if (!mpu_is_ready) {
+    return; 
+  }
+
+  // ** NEW v2.15 ** Check if we are in the 10-second cooldown period
+  unsigned long current_time = millis();
+  if (current_time - last_crash_alert_time < ALERT_COOLDOWN_MS) {
+    return; // In cooldown, don't check for a new crash
+  }
+
+  sensors_event_t accel, gyro, temp;
+  
+  // Safety check to stop error flood
+  if (!mpu.getEvent(&accel, &gyro, &temp)) {
+    Serial.println("\n❌ ERROR: Failed to read MPU6050 during loop.");
+    Serial.println("   This is a hardware power/signal issue.");
+    Serial.println("   Accident detection is now DISABLED.");
+    mpu_is_ready = false; // Disable MPU checking permanently
+    return;
+  }
+  
+  // Calculate total acceleration magnitude
+  float total_accel = sqrt(
+    accel.acceleration.x * accel.acceleration.x +
+    accel.acceleration.y * accel.acceleration.y +
+    accel.acceleration.z * accel.acceleration.z
+  );
+
+  // ** MODIFIED v2.15 ** - Removed 'accident_detected_latch' from this 'if'
+  if (total_accel > CRASH_THRESHOLD) {
+    
+    // ** NEW v2.15 ** - Set the cooldown timer
+    last_crash_alert_time = current_time;
+    
+    Serial.println("\n╔════════════════════════════════════════╗");
+    Serial.println("║   ⚠️  CRASH DETECTED!                  ║");
+    Serial.println("╚════════════════════════════════════════╝");
+    Serial.printf("    Impact Force: %.2f m/s²\n", total_accel);
+    Serial.printf("    Threshold: %.2f m/s²\n\n", CRASH_THRESHOLD);
+    
+    sendSmsAlert("⚠️ CRASH DETECTED! High impact force. Rider may need help!");
+    triggerBuzzer(5000); // Trigger buzzer for 5 seconds
+  }
+}
+
+// 
+// ** MODIFIED v2.20 ** - Checks all sensors independently and uses timer
+//
+void checkEnvironmentalAlerts() {
+  // ** LATCH REMOVED v2.20 **
+  // We now rely on the 10-second cooldown in the main loop()
+  
+  String alert_message = "";
+  bool alert_found = false; // Flag to track if we found anything
+
+  // --- Alcohol check ---
+  int alcohol = analogRead(MQ3_PIN);
+  if (alcohol > mq3_threshold) {
+    int percent_increase = ((alcohol - mq3_baseline) * 100) / mq3_baseline;
+    alert_message += "🍺 ALCOHOL DETECTED! (+" + String(percent_increase) + "%)\n";
+    alert_found = true;
+  }
+
+  // --- Air quality check ---
+  int aqi = analogRead(MQ135_PIN);
+  if (aqi > mq135_threshold) {
+    int percent_increase = ((aqi - mq135_baseline) * 100) / mq135_baseline; 
+    alert_message += "💨 POOR AIR QUALITY! (+" + String(percent_increase) + "%)\n";
+    alert_found = true;
+  }
+  
+  // --- Temperature check ---
+  float temp = dht.readTemperature();
+  if (!isnan(temp) && temp > TEMP_THRESHOLD) {
+    alert_message += "🌡️ HIGH TEMPERATURE! " + String(temp, 1) + "°C\n";
+    alert_found = true;
+  }
+
+  // Trigger alert if needed
+  if (alert_found) {
+    Serial.println("\n🚨 ENVIRONMENTAL ALERT DETECTED:\n" + alert_message);
+    
+    sendSmsAlert(alert_message); // Send the combined message
+    triggerBuzzer(5000); // Trigger buzzer for 5 seconds
+    
+    // ** MODIFIED v2.20 **
+    // Reset the cooldown timer so this function doesn't run
+    // again for 10 seconds, preventing buzzer loops.
+    last_env_alert_time = millis(); 
+    
+    // ** LATCH REMOVED v2.20 **
+    // environmental_alert_latch = true; 
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//                 BUZZER TIMER FUNCTIONS (NEW v2.9)
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * @brief Triggers the buzzer to turn on for a set duration.
+ * @param duration_ms How long the buzzer should stay on (in milliseconds).
+ */
+void triggerBuzzer(unsigned long duration_ms) {
+  buzzer_duration = duration_ms;
+  buzzer_on_time = millis(); // Start the timer
+}
+
+/**
+ * @brief Manages the buzzer timer. MUST be called in the main loop().
+ */
+void handleBuzzer() {
+  if (buzzer_on_time > 0) {
+    // Check if the buzzer duration has passed
+    if (millis() - buzzer_on_time < buzzer_duration) {
+      digitalWrite(MAIN_BUZZER_PIN, HIGH); // Buzzer ON
+    } else {
+      digitalWrite(MAIN_BUZZER_PIN, LOW);  // Buzzer OFF
+      buzzer_on_time = 0; // Reset the timer
+    }
+  }
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+//             SMS ALERT SYSTEM (NON-BLOCKING)
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Gets the current GPS location as a formatted string.
+ */
+String getGpsLocationString() {
+  // GPS functionality has been removed.
+  return "📍 Location: GPS module not installed";
+}
+
+/**
+ * Queues an SMS alert to be sent by the state machine.
+ */
+void sendSmsAlert(String message) {
+  if (alert_pending) {
+    Serial.println("📤 SMS already in progress. New alert ignored.");
+    return;
+  }
+
+  Serial.println("📤 Queuing emergency SMS...");
+  Serial.println("───────────────────────────────────────");
+  
+  // ** THIS LINE IS NOW FIXED (v2.13) **
+  alert_message_to_send = message + "\n" + getGpsLocationString() + 
+                          "\n\n- Smart Helmet Alert System";
+                          
+  contact_index_to_send = 0; 
+  alert_pending = true;
+  sms_state = SMS_SEND_CMD; 
+}
+
+/**
+ * NON-BLOCKING State Machine for sending SMS.
+ */
+void handleSmsSending() {
+  if (!alert_pending) return;
+
+  unsigned long current_millis = millis();
+
+  switch (sms_state) {
+    
+    case SMS_IDLE:
+      // Waiting state
+      break;
+
+    case SMS_SEND_CMD:
+      if (contact_index_to_send < NUM_CONTACTS) {
+        Serial.printf("  → Preparing for Contact %d: %s\n", 
+                      contact_index_to_send + 1, EMERGENCY_CONTACTS[contact_index_to_send]);
+        
+        clearGSMBuffer(); 
+        gsmSerial.println("AT+CMGS=\"" + String(EMERGENCY_CONTACTS[contact_index_to_send]) + "\"");
+        
+        sms_timer = current_millis;
+        sms_state = SMS_SEND_BODY;
+      } else {
+        // We have sent to all contacts
+        Serial.println("✓ All SMS alerts sent successfully\n");
+        alert_pending = false;
+        contact_index_to_send = 0;
+        sms_state = SMS_IDLE;
+      }
+      break;
+
+    case SMS_SEND_BODY:
+      // Wait for the ">" prompt from the SIM800L
+      if (gsmSerial.available()) {
+        if (gsmSerial.readString().indexOf('>') >= 0) {
+          Serial.println("    > prompt received. Sending body...");
+          gsmSerial.print(alert_message_to_send);
+          gsmSerial.write(26); // Ctrl+Z to send
+          
+          sms_timer = current_millis;
+          sms_state = SMS_WAIT_RESPONSE;
+        }
+      }
+      // ** MODIFIED v2.9 ** - Increased timeout to 5 seconds
+      if (current_millis - sms_timer > 5000) { 
+        Serial.println("    ❌ No '>' prompt. Aborting contact.");
+        contact_index_to_send++; // Move to next contact
+        sms_state = SMS_SEND_CMD;
+      }
+      break;
+
+    case SMS_WAIT_RESPONSE:
+      // Wait up to 10 seconds for the "OK" or "ERROR" response
+      if (gsmSerial.available()) {
+        String response = gsmSerial.readString();
+        if (response.indexOf("OK") >= 0) {
+           Serial.println("    ✓ SMS sent successfully.");
+        } else if (response.indexOf("ERROR") >= 0) {
+           Serial.println("    ❌ SMS send ERROR.");
+        }
+      }
+      
+      if (current_millis - sms_timer > 10000) { 
+        Serial.println("    → Send complete (or timed out). Moving to next contact.");
+        clearGSMBuffer();
+        contact_index_to_send++; // Move to next contact
+        sms_state = SMS_SEND_CMD;
+      }
+      break;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//                 UTILITY FUNCTIONS
+// ═══════════════════════════════════════════════════════════════
+
+void shortBuzz() {
+  digitalWrite(MAIN_BUZZER_PIN, HIGH);
+  delay(SHORT_BUZZ_DURATION);
+  digitalWrite(MAIN_BUZZER_PIN, LOW);
+}
+
+void clearGSMBuffer() {
+  while (gsmSerial.available()) {
+    gsmSerial.read();
+  }
+}
