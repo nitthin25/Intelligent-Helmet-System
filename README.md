@@ -201,7 +201,11 @@ Install the following libraries before uploading the code.
 
 ## Hardware Setup
 
-> *(Insert Hardware Setup Image Here)*
+<img width="305" height="412" alt="Image" src="https://github.com/user-attachments/assets/146e557c-5cd2-4bb6-95f6-c1b653f193d1" />
+
+<img width="1280" height="960" alt="Image" src="https://github.com/user-attachments/assets/b9a1d448-416e-48e5-81ec-935c53021cde" />
+
+
 
 ---
 
