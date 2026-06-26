@@ -212,18 +212,23 @@ Install the following libraries before uploading the code.
 ## Serial Monitor
 
 <img width="1241" height="246" alt="Image" src="https://github.com/user-attachments/assets/6322ab75-183f-4e3b-9ddb-1b2153e4770e" />
+
 #Alcohol Sensing
 
 <img width="1481" height="498" alt="Image" src="https://github.com/user-attachments/assets/0c6bbc94-1caa-4fc0-8d9e-56800307c72d" />
+
 #Calibration
 
 <img width="450" height="189" alt="Image" src="https://github.com/user-attachments/assets/97ecd6b1-8fef-4dbe-a2da-601f12fd9d76" />
+
 #enivroinment sensing
 
 <img width="1241" height="246" alt="Image" src="https://github.com/user-attachments/assets/1be59b0e-33ed-484d-88a9-51fc1e81f7ce" />
+
 #Panic Button
 
 <img width="1241" height="246" alt="Image" src="https://github.com/user-attachments/assets/9ef61b89-2db0-4778-823e-e441a1d465e4" />
+
 #System Ready
 
 ---
