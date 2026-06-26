@@ -195,7 +195,7 @@ Install the following libraries before uploading the code.
 
 ## Prototype
 
-> *(Insert Prototype Image Here)*
+<img width="536" height="370" alt="Image" src="https://github.com/user-attachments/assets/db1b6a63-c6a5-4453-ba03-27d22cf28169" />
 
 ---
 
