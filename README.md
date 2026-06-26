@@ -235,7 +235,7 @@ Install the following libraries before uploading the code.
 
 ## Fatigue Detection Interface
 
-> *(Insert ESP32-CAM Screenshot Here)*
+<img width="1130" height="579" alt="Image" src="https://github.com/user-attachments/assets/db143ab8-3ffd-4554-b403-2cd2e6ba04af" />
 
 ---
 
